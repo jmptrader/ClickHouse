@@ -1,10 +1,12 @@
 import argparse
+from pathlib import Path
 
 from praktika.result import Result
 from praktika.settings import Settings
 from praktika.utils import MetaClasses, Shell, Utils
 
 from ci.jobs.scripts.clickhouse_version import CHVersion
+from ci.workflows.defs import ToolSet
 
 
 class JobStages(metaclass=MetaClasses.WithIter):
@@ -13,6 +15,7 @@ class JobStages(metaclass=MetaClasses.WithIter):
     UNSHALLOW = "unshallow"
     BUILD = "build"
     PACKAGE = "package"
+    UNIT = "unit"
 
 
 def parse_args():
@@ -36,12 +39,15 @@ CMAKE_CMD = """cmake --debug-trycompile -DCMAKE_VERBOSE_MAKEFILE=1 -LA \
 -DENABLE_UTILS=0 -DCMAKE_FIND_PACKAGE_NO_PACKAGE_REGISTRY=ON -DCMAKE_INSTALL_PREFIX=/usr \
 -DCMAKE_INSTALL_SYSCONFDIR=/etc -DCMAKE_INSTALL_LOCALSTATEDIR=/var -DCMAKE_SKIP_INSTALL_ALL_DEPENDENCY=ON \
 {AUX_DEFS} \
--DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
+-DCMAKE_C_COMPILER={COMPILER} -DCMAKE_CXX_COMPILER={COMPILER_CPP} \
 -DCOMPILER_CACHE={CACHE_TYPE} -DENABLE_BUILD_PROFILING=1 {DIR}"""
+
+# release:          cmake --debug-trycompile -DCMAKE_VERBOSE_MAKEFILE=1 -LA -DCMAKE_BUILD_TYPE=None -DSANITIZE= -DENABLE_CHECK_HEAVY_BUILDS=1 -DENABLE_CLICKHOUSE_SELF_EXTRACTING=1 -DENABLE_TESTS=0 -DENABLE_UTILS=0 -DCMAKE_FIND_PACKAGE_NO_PACKAGE_REGISTRY=ON -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_SYSCONFDIR=/etc -DCMAKE_INSTALL_LOCALSTATEDIR=/var -DCMAKE_SKIP_INSTALL_ALL_DEPENDENCY=ON -DSPLIT_DEBUG_SYMBOLS=ON -DBUILD_STANDALONE_KEEPER=1 -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 -DCOMPILER_CACHE=sccache -DENABLE_BUILD_PROFILING=1 ..
+# binary release:   cmake --debug-trycompile -DCMAKE_VERBOSE_MAKEFILE=1 -LA -DCMAKE_BUILD_TYPE=None -DSANITIZE= -DENABLE_CHECK_HEAVY_BUILDS=1 -DENABLE_CLICKHOUSE_SELF_EXTRACTING=1 -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 -DCOMPILER_CACHE=sccache -DENABLE_BUILD_PROFILING=1 ..
+# release coverage: cmake --debug-trycompile -DCMAKE_VERBOSE_MAKEFILE=1 -LA -DCMAKE_BUILD_TYPE=None -DSANITIZE= -DENABLE_CHECK_HEAVY_BUILDS=1 -DENABLE_CLICKHOUSE_SELF_EXTRACTING=1 -DENABLE_TESTS=0 -DENABLE_UTILS=0 -DCMAKE_FIND_PACKAGE_NO_PACKAGE_REGISTRY=ON -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_SYSCONFDIR=/etc -DCMAKE_INSTALL_LOCALSTATEDIR=/var -DCMAKE_SKIP_INSTALL_ALL_DEPENDENCY=ON -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 -DSANITIZE_COVERAGE=1 -DBUILD_STANDALONE_KEEPER=0 -DCOMPILER_CACHE=sccache -DENABLE_BUILD_PROFILING=1 ..
 
 
 def main():
-
     args = parse_args()
 
     stop_watch = Utils.Stopwatch()
@@ -65,30 +71,52 @@ def main():
 
     BUILD_TYPE = "RelWithDebInfo"
     SANITIZER = ""
-    AUX_DEFS = " -DENABLE_TESTS=0 "
+    AUX_DEFS = " -DENABLE_TESTS=1 "
+    cmake_cmd = None
 
     if "debug" in build_type:
         print("Build type set: debug")
         BUILD_TYPE = "Debug"
-        AUX_DEFS = " -DENABLE_TESTS=1 "
+        AUX_DEFS = " -DENABLE_TESTS=0 "
+        package_type = "debug"
     elif "release" in build_type:
         print("Build type set: release")
         AUX_DEFS = (
             " -DENABLE_TESTS=0 -DSPLIT_DEBUG_SYMBOLS=ON -DBUILD_STANDALONE_KEEPER=1 "
         )
+        package_type = "release"
     elif "asan" in build_type:
         print("Sanitizer set: address")
         SANITIZER = "address"
+        package_type = "asan"
+    elif "tsan" in build_type:
+        print("Sanitizer set: thread")
+        SANITIZER = "thread"
+        package_type = "tsan"
+    elif "msan" in build_type:
+        print("Sanitizer set: memory")
+        SANITIZER = "memory"
+        package_type = "msan"
+    elif "ubsan" in build_type:
+        print("Sanitizer set: undefined")
+        SANITIZER = "undefined"
+        package_type = "ubsan"
+    elif "binary" in build_type:
+        package_type = "binary"
+        cmake_cmd = f"cmake --debug-trycompile -DCMAKE_VERBOSE_MAKEFILE=1 -LA -DCMAKE_BUILD_TYPE=None -DSANITIZE= -DENABLE_CHECK_HEAVY_BUILDS=1 -DENABLE_CLICKHOUSE_SELF_EXTRACTING=1 -DCMAKE_C_COMPILER={ToolSet.COMPILER_C} -DCMAKE_CXX_COMPILER={ToolSet.COMPILER_CPP} -DCOMPILER_CACHE=sccache -DENABLE_BUILD_PROFILING=1 {Utils.cwd()}"
     else:
         assert False
 
-    cmake_cmd = CMAKE_CMD.format(
-        BUILD_TYPE=BUILD_TYPE,
-        CACHE_TYPE=CACHE_TYPE,
-        SANITIZER=SANITIZER,
-        AUX_DEFS=AUX_DEFS,
-        DIR=Utils.cwd(),
-    )
+    if not cmake_cmd:
+        cmake_cmd = CMAKE_CMD.format(
+            BUILD_TYPE=BUILD_TYPE,
+            CACHE_TYPE=CACHE_TYPE,
+            SANITIZER=SANITIZER,
+            AUX_DEFS=AUX_DEFS,
+            DIR=Utils.cwd(),
+            COMPILER=ToolSet.COMPILER_C,
+            COMPILER_CPP=ToolSet.COMPILER_CPP,
+        )
 
     build_dir = f"{Settings.TEMP_DIR}/build"
 
@@ -149,18 +177,13 @@ def main():
         )
         Shell.check("sccache --show-stats")
         Shell.check(f"ls -l {build_dir}/programs/")
+        Shell.check(f"pwd")
+        Shell.check(f"find {build_dir} -name unit_tests_dbms")
+        Shell.check(f"find . -name unit_tests_dbms")
         res = results[-1].is_ok()
 
-    if res and JobStages.PACKAGE in stages:
-        if "debug" in build_type:
-            package_type = "debug"
-        elif "release" in build_type:
-            package_type = "release"
-        elif "asan" in build_type:
-            package_type = "asan"
-        else:
-            assert False, "TODO"
-
+    if res and JobStages.PACKAGE in stages and "binary" not in build_type:
+        assert package_type
         if "amd" in build_type:
             deb_arch = "amd64"
         else:
@@ -181,6 +204,24 @@ def main():
                 with_log=True,
             )
         )
+        res = results[-1].is_ok()
+
+    if res and JobStages.UNIT in stages and (SANITIZER or "binary" in build_type):
+        unit_tests_result_file = "/tmp/praktika/output/unit_tests_result.json"
+        unit_test_bin = "/tmp/praktika/build/src/unit_tests_dbms"
+        results.append(
+            Result.create_from_command_execution(
+                name="Unit Tests",
+                command=[
+                    f"{unit_test_bin} --gtest_output='json:{unit_tests_result_file}'"
+                ],
+                with_log=True,
+            )
+        )
+        if Path(unit_tests_result_file).is_file():
+            results[-1].set_files([unit_tests_result_file])
+        if not results[-1].is_ok():
+            results[-1].set_files([unit_test_bin])
         res = results[-1].is_ok()
 
     Result.create_from(results=results, stopwatch=stop_watch).complete_job()
